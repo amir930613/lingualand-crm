@@ -299,6 +299,9 @@ details.sec[open]>summary::before{transform:rotate(90deg)}
 .lockbox input[type=password]{font-size:16px;padding:11px 12px}
 .lockbox .btn{padding:11px;font-size:15px}
 .lerr{color:var(--bad);font-size:14px}
+.syncbtn[data-s=ok]{color:#9be6bd}
+.syncbtn[data-s=err]{color:#ffb3b6}
+.syncbtn[data-s=off]{opacity:.8}
 </style>
 
 <div class="topbar"><div class="wrap"><header>
@@ -381,8 +384,9 @@ CFG.stages[0].init=1;
 if(CFG.max==null)CFG.max=3;
 if(!CFG.mgr)CFG.mgr='';
 if(!CFG.custom)CFG.custom=[];
-function save(){wr(KEY,S)}
-function saveCfg(){wr(KEYC,CFG)}
+var SYNC=null;
+function save(){if(SYNC)SYNC.stamp();wr(KEY,S);if(SYNC)SYNC.kick()}
+function saveCfg(){wr(KEYC,CFG);if(SYNC){SYNC.stamp();SYNC.kick()}}
 function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,6)}
 /* migrate old single callback date to tasks */
 Object.keys(S).forEach(function(k){var s=S[k];if(!s.tasks){s.tasks=[];if(s.cb)s.tasks.push({id:uid(),due:s.cb,text:'Перезвонить',auto:1,done:0});delete s.cb}});
@@ -1100,6 +1104,208 @@ $('bCsv').onclick=function(){
   if(rows.length===1){toast('Пока нет ни одного действия');return}
   download('obzvon-itogi-'+dayKey(Date.now())+'.csv','text/csv;charset=utf-8','﻿'+rows.map(function(r){return r.map(csvCell).join(';')}).join('\r\n'));
 };
+/* ---------- sync between devices (GitHub, encrypted) ---------- */
+SYNC=(function(){
+  var OWNER='amir930613',REPO='lingualand-crm',BR='data',FILE='sync.json',TFILE='token.json';
+  var API='https://api.github.com/repos/'+OWNER+'/'+REPO;
+  var LT='lingualand_sync_tok',LM='lingualand_sync_meta';
+  var KB=window.__KEY;try{delete window.__KEY}catch(e){window.__KEY=null}
+  var tok=null,sha=null,etag=null,lastDoc=null,aes=null,busy=false,again=false,timer=null,pend=false;
+  var state='off',lastOk=0,lastErr='';
+  function b2u(s){var b=atob(s),u=new Uint8Array(b.length);for(var i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u}
+  function u2b(u){var s='',C=0x8000;for(var i=0;i<u.length;i+=C)s+=String.fromCharCode.apply(null,u.subarray(i,i+C));return btoa(s)}
+  async function key(){if(!aes)aes=await crypto.subtle.importKey('raw',KB,'AES-GCM',false,['encrypt','decrypt']);return aes}
+  async function enc(txt){
+    var gz=new Uint8Array(await new Response(new Blob([txt]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer());
+    var iv=crypto.getRandomValues(new Uint8Array(12));
+    var c=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv:iv},await key(),gz));
+    return {i:u2b(iv),c:u2b(c)};
+  }
+  async function dec(env){
+    var p=await crypto.subtle.decrypt({name:'AES-GCM',iv:b2u(env.i)},await key(),b2u(env.c));
+    return new Response(new Blob([p]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+  }
+  /* ---- change tracking ---- */
+  function empty(s){return !s||(!(s.calls&&s.calls.length)&&!(s.tasks&&s.tasks.length)&&!(s.comments&&s.comments.length)&&!s.ov&&!s.deal&&!s.stage)}
+  function cfgJ(){return JSON.stringify({stages:CFG.stages,max:CFG.max})}
+  function ids(){var o={};CFG.custom.forEach(function(m){o[m.id]=1});return o}
+  var meta=rd(LM);
+  function wrMeta(){wr(LM,meta)}
+  function snapshot(u){meta.sh={};Object.keys(S).forEach(function(k){if(!empty(S[k]))meta.sh[k]=JSON.stringify(S[k])});meta.cs=cfgJ();meta.ci=ids();if(u!=null)meta.cu=u}
+  if(!meta||!meta.sh){meta={tomb:{},ctomb:{},cu:0};snapshot(0);wrMeta()}
+  function stamp(){
+    var now=Date.now(),ch=false;
+    Object.keys(S).forEach(function(k){var s=S[k];if(empty(s))return;var j=JSON.stringify(s);
+      if(meta.sh[k]!==j){s._u=now;meta.sh[k]=JSON.stringify(s);delete meta.tomb[k];ch=true}});
+    Object.keys(meta.sh).forEach(function(k){if(empty(S[k])){delete meta.sh[k];meta.tomb[k]=now;ch=true}});
+    var cj=cfgJ();if(meta.cs!==cj){meta.cs=cj;meta.cu=now;ch=true}
+    var cur=ids();
+    Object.keys(meta.ci).forEach(function(id){if(!cur[id]){meta.ctomb[id]=now;ch=true}});
+    Object.keys(cur).forEach(function(id){if(!meta.ci[id])ch=true});
+    meta.ci=cur;
+    if(ch)wrMeta();return ch;
+  }
+  /* ---- merge ---- */
+  function sc(x){return (x.calls||[]).length+(x.comments||[]).length+(x.tasks||[]).length}
+  function cm(o){var k=Object.keys(o||{}).sort();return JSON.stringify(k.map(function(x){return [x,o[x]]}))}
+  function canon(d){return cm(d.s)+'|'+cm(d.t)+'|'+JSON.stringify(d.c||null)+'|'+JSON.stringify(d.cu||[])+'|'+cm(d.ct)}
+  function merge(R){
+    R=R||{s:{},t:{},c:null,cu:[],ct:{}};
+    var out={v:1,s:{},t:{},c:null,cu:[],ct:{}},keys={};
+    [S,meta.tomb,R.s,R.t].forEach(function(o){Object.keys(o||{}).forEach(function(k){keys[k]=1})});
+    Object.keys(keys).forEach(function(k){
+      var L=empty(S[k])?null:S[k],Rm=R.s[k]||null;
+      var lv=L?(L._u||0):(meta.tomb[k]!=null?meta.tomb[k]:-1);
+      var rv=Rm?(Rm._u||0):(R.t[k]!=null?R.t[k]:-1);
+      var useR=rv>lv||(rv===lv&&Rm&&(!L||sc(Rm)>=sc(L)));
+      if(useR){if(Rm)out.s[k]=Rm;else if(R.t[k]!=null)out.t[k]=R.t[k]}
+      else{if(L)out.s[k]=L;else if(meta.tomb[k]!=null)out.t[k]=meta.tomb[k]}
+    });
+    var lc={stages:CFG.stages,max:CFG.max,u:meta.cu||0};
+    out.c=(R.c&&(R.c.u||0)>=lc.u)?R.c:lc;
+    var ct={};[meta.ctomb,R.ct||{}].forEach(function(o){Object.keys(o).forEach(function(id){ct[id]=Math.max(ct[id]||0,o[id])})});
+    out.ct=ct;var seen={};
+    CFG.custom.concat(R.cu||[]).forEach(function(m){if(seen[m.id]||ct[m.id])return;seen[m.id]=1;out.cu.push(m)});
+    out.cu.sort(function(a,b){return (a.t||0)-(b.t||0)});
+    var localDoc={s:{},t:meta.tomb,c:lc,cu:CFG.custom,ct:meta.ctomb};Object.keys(meta.sh).forEach(function(k){localDoc.s[k]=S[k]});
+    var oj=canon(out);
+    return {out:out,localCh:oj!==canon(localDoc),remoteCh:oj!==canon(R)};
+  }
+  function apply(out){
+    Object.keys(S).forEach(function(k){if(!out.s[k])delete S[k]});
+    Object.keys(out.s).forEach(function(k){S[k]=out.s[k]});
+    CFG.stages=out.c.stages;CFG.max=out.c.max;indexStages();
+    var keep={};out.cu.forEach(function(m){keep[m.id]=1});
+    for(var i=CARDS.length-1;i>=0;i--){var c=CARDS[i];if(c.custom&&!keep[c.id]){CARDS.splice(i,1);delete IDX[c.id];if(view.cur===c.id)view.cur=null;if(view.drawer===c.id)closeDrawer(true)}}
+    var have={};CFG.custom.forEach(function(m){have[m.id]=1});
+    out.cu.forEach(function(m){if(!have[m.id])CARDS.push(customCard(m))});
+    CFG.custom=out.cu.slice();
+    meta.tomb=out.t;meta.ctomb=out.ct;snapshot(out.c.u||0);
+    reindex();wr(KEY,S);wr(KEYC,CFG);wrMeta();
+    refresh();
+  }
+  function busyUI(){
+    var a=document.activeElement;
+    if(a&&/^(TEXTAREA|INPUT|SELECT)$/.test(a.tagName)&&a.id!=='q'&&!a.closest('#lock'))return true;
+    if(drag)return true;
+    return false;
+  }
+  function refresh(){if(busyUI()){pend=true;return}pend=false;buildFilters();render(true)}
+  document.addEventListener('focusout',function(){if(pend)setTimeout(function(){if(pend)refresh()},400)});
+  /* ---- GitHub API ---- */
+  function gh(method,path,body,hdr,auth){
+    var h={'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'};
+    if(auth!==false&&tok)h['Authorization']='Bearer '+tok;
+    if(body)h['Content-Type']='application/json';
+    for(var k in hdr||{})h[k]=hdr[k];
+    return fetch(API+path,{method:method,headers:h,body:body?JSON.stringify(body):undefined,cache:'no-store'});
+  }
+  function fail(r){var e=new Error('HTTP '+r.status);e.status=r.status;return e}
+  async function b64of(j){
+    if(j.content&&j.encoding==='base64')return j.content.replace(/\n/g,'');
+    var r=await gh('GET','/git/blobs/'+j.sha);if(!r.ok)throw fail(r);return (await r.json()).content.replace(/\n/g,'');
+  }
+  async function pull(){
+    var r=await gh('GET','/contents/'+FILE+'?ref='+BR,null,etag&&lastDoc?{'If-None-Match':etag}:null);
+    if(r.status===304)return lastDoc;
+    if(r.status===404){sha=null;etag=null;lastDoc=null;return null}
+    if(!r.ok)throw fail(r);
+    var j=await r.json();
+    var doc=JSON.parse(await dec(JSON.parse(atob(await b64of(j)))));
+    sha=j.sha;etag=r.headers.get('ETag');lastDoc=doc;return doc;
+  }
+  async function ensureBranch(){
+    var r=await gh('GET','/git/ref/heads/'+BR);if(r.ok)return;
+    var m=await gh('GET','/git/ref/heads/main');if(!m.ok)throw fail(m);
+    var c=await gh('POST','/git/refs',{ref:'refs/heads/'+BR,sha:(await m.json()).object.sha});
+    if(!c.ok&&c.status!==422)throw fail(c);
+  }
+  async function push(doc){
+    var env=await enc(JSON.stringify(doc));
+    var body={message:'sync '+new Date().toISOString(),content:btoa(JSON.stringify(env)),branch:BR};if(sha)body.sha=sha;
+    if(!sha)await ensureBranch();
+    var r=await gh('PUT','/contents/'+FILE,body);
+    if(r.status===409||r.status===422){etag=null;return false}
+    if(!r.ok)throw fail(r);
+    sha=(await r.json()).content.sha;etag=null;lastDoc=doc;return true;
+  }
+  async function run(){
+    if(!tok)return;
+    if(busy){again=true;return}
+    busy=true;setState('busy');
+    try{
+      var done=false;
+      for(var n=0;n<5&&!done;n++){
+        stamp();
+        var R=await pull();
+        var m=merge(R);
+        if(m.localCh)apply(m.out);
+        if(!m.remoteCh)done=true;else done=await push(m.out);
+      }
+      if(!done)throw new Error('conflict');
+      lastOk=Date.now();setState('ok');
+    }catch(e){
+      if(e.status===401){tok=null;try{store&&store.removeItem(LT)}catch(x){}lastErr='Ключ доступа недействителен';setState('off')}
+      else{lastErr=(e.status===403||e.status===429)?'GitHub временно ограничил запросы':(navigator.onLine===false?'Нет интернета':'Нет связи с сервером');setState('err')}
+    }finally{busy=false;if(again){again=false;setTimeout(run,300)}}
+  }
+  function kick(){if(!tok)return;clearTimeout(timer);timer=setTimeout(run,1200);setState('wait')}
+  setInterval(function(){if(tok&&document.visibilityState==='visible')run()},20000);
+  document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible')run()});
+  window.addEventListener('online',function(){run()});
+  /* ---- status button ---- */
+  var btn=el('button','btn syncbtn');btn.id='bSync';$('bTheme').parentNode.insertBefore(btn,$('bTheme'));
+  function hm(t){var d=new Date(t);return pad(d.getHours())+':'+pad(d.getMinutes())}
+  function setState(s){
+    state=s;btn.dataset.s=s;
+    btn.textContent=s==='off'?'☁ Синхр. выкл.':s==='ok'?'☁ Сохранено':s==='err'?'☁ Нет связи':'☁ Сохраняю…';
+    btn.title=s==='ok'?'Все изменения сохранены на сервере ('+hm(lastOk)+')':s==='err'?lastErr+'. Изменения сохранены на этом устройстве и отправятся автоматически.':s==='off'?'Изменения видны только на этом устройстве. Нажмите, чтобы подключить синхронизацию.':'Отправляю изменения…';
+  }
+  btn.onclick=function(){
+    openModal('Синхронизация между устройствами',function(b){
+      var f=el('div','form');
+      var msg=state==='ok'?'Включена. Последняя синхронизация: '+hm(lastOk)+'. Изменения появляются на других устройствах в течение ~20 секунд.'
+        :state==='err'?'Включена, но сейчас '+lastErr.toLowerCase()+'. Работать можно: изменения сохранены на этом устройстве и отправятся сами, когда связь появится.'
+        :tok?'Включена, идёт сохранение…':'Не подключена: изменения видны только на этом устройстве.'+(lastErr?' ('+lastErr+')':'');
+      f.appendChild(el('p','',msg));
+      if(tok){var now=el('button','btn primary','Синхронизировать сейчас');now.onclick=function(){closeModal();run()};f.appendChild(now)}
+      f.appendChild(el('h3','mh',tok?'Заменить ключ доступа':'Подключить (делает владелец, один раз)'));
+      f.appendChild(el('div','hint','Вставьте ключ GitHub (fine-grained token с доступом Contents: Read and write к репозиторию '+REPO+'). Он сохранится в зашифрованном виде, и все, кто входит по паролю, будут синхронизироваться автоматически.'));
+      var ti=document.createElement('input');ti.type='password';ti.placeholder='github_pat_…';ti.autocomplete='off';f.appendChild(ti);
+      var go=el('button','btn','Подключить');f.appendChild(go);
+      go.onclick=async function(){
+        var t=ti.value.trim();if(!t){toast('Вставьте ключ');return}
+        go.disabled=true;go.textContent='Проверяю…';
+        try{await connect(t);closeModal();toast('Синхронизация подключена')}
+        catch(e){go.disabled=false;go.textContent='Подключить';toast(e.message||'Не получилось')}
+      };
+      b.appendChild(f);
+    });
+  };
+  /* ---- token ---- */
+  async function connect(t){
+    var r=await fetch('https://api.github.com/repos/'+OWNER+'/'+REPO,{headers:{'Authorization':'Bearer '+t,'Accept':'application/vnd.github+json'},cache:'no-store'});
+    if(r.status===401)throw new Error('GitHub не принял ключ — проверьте, что скопировали его целиком');
+    if(!r.ok)throw new Error('У ключа нет доступа к репозиторию '+REPO);
+    var j=await r.json();if(!j.permissions||!j.permissions.push)throw new Error('Ключу нужно право Contents: Read and write');
+    tok=t;var env=await enc(t);
+    try{store&&store.setItem(LT,JSON.stringify(env))}catch(e){}
+    var g=await gh('GET','/contents/'+TFILE+'?ref=main');var body={message:'sync key',content:btoa(JSON.stringify(env)),branch:'main'};
+    if(g.ok)body.sha=(await g.json()).sha;
+    var p=await gh('PUT','/contents/'+TFILE,body);if(!p.ok)throw new Error('Не удалось сохранить ключ в репозиторий (HTTP '+p.status+')');
+    lastErr='';await run();
+  }
+  async function loadTok(){
+    var raw=null;try{raw=store&&store.getItem(LT)}catch(e){}
+    var envs=[];if(raw)try{envs.push(JSON.parse(raw))}catch(e){}
+    try{var r=await fetch('token.json?'+Date.now(),{cache:'no-store'});if(r.ok)envs.push(await r.json())}catch(e){}
+    if(!envs.length||raw==null)try{var a=await fetch(API+'/contents/'+TFILE+'?ref=main',{headers:{'Accept':'application/vnd.github.raw+json'},cache:'no-store'});if(a.ok)envs.push(await a.json())}catch(e){}
+    for(var i=0;i<envs.length;i++){try{var t=await dec(envs[i]);if(t){tok=t;try{store&&store.setItem(LT,JSON.stringify(envs[i]))}catch(e){}return}}catch(e){}}
+  }
+  setState('off');
+  loadTok().then(function(){if(tok)run();else setState('off')});
+  return {stamp:stamp,kick:kick,run:run};
+})();
 render();
 window.__crm={S:S,CFG:CFG,get CARDS(){return CARDS},view:view,render:render,moveTo:moveTo,openDrawer:openDrawer,stageOf:stageOf};
 })();
@@ -1121,6 +1327,7 @@ async function open(keyBytes,remember){
   var key=await crypto.subtle.importKey('raw',keyBytes,'AES-GCM',false,['decrypt']);
   var plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:b2u(enc.i)},key,b2u(enc.c));
   window.__DATA=await gunzip(plain);
+  window.__KEY=keyBytes;
   if(remember){try{localStorage.setItem(LK,u2b(keyBytes))}catch(e){}}
   var s=document.createElement('script');s.textContent=document.getElementById('appsrc').textContent;document.body.appendChild(s);
   document.getElementById('lock').remove();
